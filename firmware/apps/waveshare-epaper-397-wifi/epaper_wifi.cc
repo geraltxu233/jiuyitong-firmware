@@ -20,10 +20,12 @@
 
 namespace {
 constexpr const char* TAG = "WS397.wifi";
-constexpr int kRouteRowsPerPage = 5;  // 大字页每页行数，与 ui.cc 的排版一致
-constexpr int kDeptRowsPerPage = 6;   // 科室列表页：28 px 行，整屏放 6 行
-enum class Page { kHome, kMenu, kSessions, kReset, kRoute, kDeptList, kDeptDetail, kPortrait };
-enum class Action { kUp, kDown, kCenter, kMenu, kBack, kProto };
+// 绘制层有 11 个物理行槽（ui.cc 的 kBodyRows）。35 px 正文一条逻辑行能放 12 个汉字，
+// 实测 7 条文案全部单行放下；留 2 个槽给偶发折行，所以一页排 9 条逻辑行。
+constexpr int kRouteRowsPerPage = 9;
+constexpr int kDeptRowsPerPage = 10;   // 科室名 4–5 字，40 px 一屏 10 条（与 ui.cc 的 kListRows 对齐）
+enum class Page { kHome, kMenu, kSessions, kReset, kRoute, kDeptList, kDeptDetail };
+enum class Action { kUp, kDown, kCenter, kMenu, kBack };
 struct Input { Action action; uint32_t view; };
 }
 
@@ -86,25 +88,29 @@ private:
     }
     void Save() {
         nvs_handle_t handle;
-        if (nvs_open("ws397_wifi", NVS_READWRITE, &handle) != ESP_OK) { Message("Could not save settings"); return; }
+        if (nvs_open("ws397_wifi", NVS_READWRITE, &handle) != ESP_OK) { Message("设置保存失败"); return; }
         esp_err_t error = nvs_set_i32(handle, "agent", saved_agent_);
         if (error == ESP_OK) error = nvs_set_str(handle, "session", session_);
         if (error == ESP_OK) error = nvs_set_str(handle, "name", session_name_);
         if (error == ESP_OK) error = nvs_set_i32(handle, "volume", volume_);
         if (error == ESP_OK) error = nvs_commit(handle);
         nvs_close(handle);
-        if (error != ESP_OK) Message("Could not save settings");
+        if (error != ESP_OK) Message("设置保存失败");
     }
     void Message(const char* message) { snprintf(message_, sizeof message_, "%s", message); }
     bool Error(esp_err_t error) {
         if (error == ESP_OK) return false;
-        snprintf(message_, sizeof message_, "Request failed: %s", esp_err_to_name(error));
+        snprintf(message_, sizeof message_, "请求失败：%s", esp_err_to_name(error));
         ESP_LOGW(TAG, "%s", message_); return true;
     }
     void Home() { page_ = Page::kHome; cursor_ = 0; ++view_; }
     void EndCall() {
         call_ = active_ = false; requested_ = 0;
         audio_.Stop(); (void)agent_link_end_realtime();
+        // 上一轮对话的回复属于"这次通话"，不是首页的一部分。不清掉的话，
+        // 按 BOOT 退出通话后首页会同时写着"请说一声你好"和上一轮的整段回答，
+        // 老人会以为那是当前要说的话。Ui 那边同时会在回复消失时强制全刷，擦掉残影。
+        ui_.Answer("");
     }
     bool SyncAgent(bool explain = false) {
         agent_link_platform_agent_t bound{};
@@ -116,14 +122,14 @@ private:
                 EndCall(); Home();
             }
             agent_ = 0; voice_ = false;
-            if (explain) Message("Finish activation and bind an Agent in the platform console");
+            if (explain) Message("请先完成激活，并在控制台绑定智能体");
             return false;
         }
         if (agent_ != bound.id) {
             EndCall(); Home();
             if (saved_agent_ != bound.id) {
                 session_[0] = session_name_[0] = 0;
-                Message("Agent changed. Choose or create a conversation.");
+                Message("智能体已变更，请重试");
             }
             agent_ = saved_agent_ = bound.id;
             Save();
@@ -135,12 +141,12 @@ private:
     void Busy(const char* title) {
         epaper::Screen screen{}; screen.view = ++view_;
         snprintf(screen.title, sizeof screen.title, "%s", title);
-        snprintf(screen.detail, sizeof screen.detail, "Please wait...");
+        snprintf(screen.detail, sizeof screen.detail, "请稍候……");
         screen.footer[0] = 0; ui_.Publish(screen);
     }
     void Sessions(size_t offset = 0) {
         EndCall(); if (!SyncAgent(true)) return;
-        Busy("Loading conversations");
+        Busy("正在加载会话");
         const int requested_agent = agent_;
         agent_link_platform_conversation_t fetched[3]{};
         size_t count = 0, total = 0;
@@ -149,7 +155,7 @@ private:
             offset = 0;
             if (Error(agent_link_platform_conversations(requested_agent, offset, fetched, 3, &count, &total))) return;
         }
-        if (!SyncAgent(true) || requested_agent != agent_) { Home(); Message("Agent changed; reopen conversations"); return; }
+        if (!SyncAgent(true) || requested_agent != agent_) { Home(); Message("智能体已变更，请重试"); return; }
         memcpy(sessions_, fetched, sizeof sessions_);
         count_ = count; offset_ = offset; more_ = offset + count < total;
         page_ = Page::kSessions; cursor_ = 0; ++view_;
@@ -157,15 +163,15 @@ private:
     }
     void NewSession() {
         EndCall(); if (!SyncAgent(true)) return;
-        Busy("Creating conversation");
+        Busy("正在新建会话");
         const int requested_agent = agent_;
         char created[sizeof session_]{};
         if (Error(agent_link_platform_create_conversation(requested_agent, created, sizeof created))) return;
-        if (!SyncAgent(true) || requested_agent != agent_) { Home(); Message("Agent changed; reopen conversations"); return; }
-        if (!created[0]) { Message("Platform returned no conversation"); return; }
+        if (!SyncAgent(true) || requested_agent != agent_) { Home(); Message("智能体已变更，请重试"); return; }
+        if (!created[0]) { Message("平台未返回会话"); return; }
         snprintf(session_, sizeof session_, "%s", created);
-        snprintf(session_name_, sizeof session_name_, "New conversation");
-        Save(); Home(); Message("Conversation ready. Center: start call.");
+        snprintf(session_name_, sizeof session_name_, "新会话");
+        Save(); Home(); Message("会话已就绪，中键通话");
     }
     // H1：写死的样例卡，只用来验证大字排版、字库覆盖和单行裁切，不做任何网络请求。
     // 上屏内容必须自带"样例数据"标注，不能让人误以为是真实公交结果。
@@ -219,12 +225,12 @@ private:
         if (route_view_.state == RouteCard::State::kFailed) {
             snprintf(screen.detail, sizeof screen.detail, "%s",
                      route_view_.source[0] ? route_view_.source : "网络不好，请再试");
-            snprintf(screen.footer, sizeof screen.footer, "中键 重试   BOOT 返回");
+            snprintf(screen.footer, sizeof screen.footer, "中键重试  BOOT返回");
             return;
         }
         if (route_view_.state == RouteCard::State::kLoading) {
             snprintf(screen.detail, sizeof screen.detail, "正在查询公交，请稍候");
-            snprintf(screen.footer, sizeof screen.footer, "BOOT 返回");
+            snprintf(screen.footer, sizeof screen.footer, "BOOT返回");
             return;
         }
         const int first = route_page_ * kRouteRowsPerPage;
@@ -235,11 +241,13 @@ private:
         }
         snprintf(screen.detail, sizeof screen.detail, "%s", route_view_.source);
         const int pages = RoutePages();
+        // 页脚 28 px 一行只有 440 px 可用（约 15 个汉字），提示语按实测宽度裁剪：
+        // 多页时保留"翻页 + 返回"，重查退到第二优先——它只在联网失败时才是主操作。
         if (pages > 1)
-            snprintf(screen.footer, sizeof screen.footer, "%d/%d 页   Up/Down 翻页   中键 重查   BOOT 返回",
+            snprintf(screen.footer, sizeof screen.footer, "%d/%d 页  上下键翻页  BOOT返回",
                      route_page_ + 1, pages);
         else
-            snprintf(screen.footer, sizeof screen.footer, "中键 重查   BOOT 返回");
+            snprintf(screen.footer, sizeof screen.footer, "中键重查  BOOT返回");
     }
     // 院内科室：先列表选科室，再出大字卡。数据是开机就在闪存里的静态表，离线可查。
     void DeptList() {
@@ -256,10 +264,10 @@ private:
             snprintf(screen.rows[row], sizeof screen.rows[row], "%d. %s", start + i + 1,
                      kDepartments[start + i].name);
         screen.selected = dept_cursor_ - start;
-        snprintf(screen.title, sizeof screen.title, "院内科室 / 中山医院");
+        snprintf(screen.title, sizeof screen.title, "中山医院科室");
         snprintf(screen.detail, sizeof screen.detail, "第 %d-%d 项，共 %d 项", start + 1, start + row,
                  kDepartmentCount);
-        snprintf(screen.footer, sizeof screen.footer, "Up/Down 选择   中键 查看   BOOT 返回");
+        snprintf(screen.footer, sizeof screen.footer, "上下键选择  中键查看  BOOT返回");
     }
     void PublishDept(epaper::Screen& screen) {
         if (dept_selected_ < 0 || dept_selected_ >= kDepartmentCount) return;
@@ -269,39 +277,20 @@ private:
         for (int i = 0; i < 5; ++i)
             if (dept.lines[i]) snprintf(screen.rows[i], sizeof screen.rows[i], "%s", dept.lines[i]);
         snprintf(screen.detail, sizeof screen.detail, "%s", dept.hours);
-        snprintf(screen.footer, sizeof screen.footer, "院内静态表 · 以现场指引为准 · BOOT 返回");
-    }
-    // 竖屏原型：只为验证"480×800 逻辑坐标 + 文字自动换行"能不能看。
-    // 数据全是写死的样品，不联网、不影响其它页面；长按上键进入，BOOT 返回。
-    void Portrait() {
-        EndCall();
-        page_ = Page::kPortrait; ++view_;
-        message_[0] = 0;
-        ESP_LOGI(TAG, "portrait: prototype page");
-    }
-    void PublishPortrait(epaper::Screen& screen) {
-        screen.portrait = true;
-        snprintf(screen.title, sizeof screen.title, "去中山医院");
-        snprintf(screen.rows[0], sizeof screen.rows[0],
-                 "出小区东门向东走200米到龙阳路站换乘58路");
-        snprintf(screen.detail, sizeof screen.detail,
-                 "说明：这一行是 28 像素字号，每行约 15 个汉字，太长会自动换行不截断。"
-                 "上面那一行是 56 像素，每行只有 7 个汉字，同样一句要占三四行。"
-                 "竖屏更窄，靠换行和更多行数装下同样的内容。");
-        snprintf(screen.footer, sizeof screen.footer, "长按上键进入　BOOT 返回");
+        snprintf(screen.footer, sizeof screen.footer, "静态表·以现场为准·BOOT返回");
     }
     void Call() {
-        if (call_) { EndCall(); Message("Call ended"); return; }
+        if (call_) { EndCall(); Message("已挂断"); return; }
         if (!SyncAgent(true)) return;
         if (!session_[0]) { Sessions(); return; }
-        if (!voice_) { Message("Bound Agent does not support realtime voice"); return; }
-        if (!audio_.Ready()) { Message("Audio unavailable. Check hardware and restart."); return; }
+        if (!voice_) { Message("该智能体不支持语音"); return; }
+        if (!audio_.Ready()) { Message("音频不可用，请重启"); return; }
         const agent_state_t state = agent_link_state();
-        if (state != AGENT_STATE_CONNECTED && state != AGENT_STATE_READY) { Message("Waiting for platform connection"); return; }
+        if (state != AGENT_STATE_CONNECTED && state != AGENT_STATE_READY) { Message("正在等待平台连接"); return; }
         ui_.Answer("");
         if (!Error(agent_link_request_realtime_session(agent_, session_))) {
             call_ = true; active_ = false; requested_ = esp_timer_get_time();
-            Message("Connecting voice. BOOT or center: end.");
+            Message("接通中，中键挂断");
         }
     }
     void Choose() {
@@ -318,7 +307,7 @@ private:
                 EndCall();
                 if (!Error(agent_link_forget())) {
                     session_[0] = session_name_[0] = 0; agent_ = saved_agent_ = 0;
-                    Save(); Home(); Message("Unbind in console before activating again. WiFi is retained.");
+                    Save(); Home(); Message("请先在控制台解绑，WiFi 会保留");
                 }
             } else Home();
         } else {
@@ -326,7 +315,7 @@ private:
             if (cursor_ < count_) {
                 snprintf(session_, sizeof session_, "%s", sessions_[cursor_].id);
                 snprintf(session_name_, sizeof session_name_, "%s", sessions_[cursor_].name);
-                Save(); Home(); Message("Conversation selected. Center: start call.");
+                Save(); Home(); Message("已选择会话，中键通话");
             } else {
                 size_t row = cursor_ - count_;
                 if (more_ && row-- == 0) { Sessions(offset_ + count_); return; }
@@ -343,47 +332,50 @@ private:
     void Publish() {
         epaper::Screen screen{}; screen.view = view_;
         if (page_ == Page::kRoute) { PublishRoute(screen); ui_.Publish(screen); return; }
-        if (page_ == Page::kPortrait) { PublishPortrait(screen); ui_.Publish(screen); return; }
         if (page_ == Page::kDeptList) { PublishDeptList(screen); ui_.Publish(screen); return; }
         if (page_ == Page::kDeptDetail) { PublishDept(screen); ui_.Publish(screen); return; }
         if (CLOUD_PRODUCT_ID <= 0) {
-            snprintf(screen.title, sizeof screen.title, "Platform product ID is not configured");
-            snprintf(screen.detail, sizeof screen.detail, "Register this profile in products.json and rebuild.");
+            snprintf(screen.title, sizeof screen.title, "未配置平台产品 ID");
+            snprintf(screen.detail, sizeof screen.detail, "请在 products.json 注册本机型后重编");
         } else {
-            snprintf(screen.title, sizeof screen.title, "%s", page_ == Page::kMenu ? "Menu / 菜单" :
-                     page_ == Page::kSessions ? "Choose conversation" : page_ == Page::kReset ? "Reset activation?" :
+            snprintf(screen.title, sizeof screen.title, "%s", page_ == Page::kMenu ? "菜单" :
+                     page_ == Page::kSessions ? "选择会话" : page_ == Page::kReset ? "重置激活？" :
                      active_ ? "请说话" : call_ ? "正在接通" : "就医通");
-            if (page_ == Page::kReset) snprintf(screen.detail, sizeof screen.detail, "Keeps WiFi. Unbind in console before activating again.");
+            if (page_ == Page::kReset) snprintf(screen.detail, sizeof screen.detail, "WiFi 保留，先在控制台解绑");
             else if (message_[0]) snprintf(screen.detail, sizeof screen.detail, "%s", message_);
             else if (page_ == Page::kHome) snprintf(screen.detail, sizeof screen.detail, "请说一声你好");
-            else snprintf(screen.detail, sizeof screen.detail, "%s / %s", agent_name_[0] ? agent_name_ : "Bind Agent in console",
-                          session_name_[0] ? session_name_ : session_[0] ? "Selected conversation" : "No conversation selected");
+            else snprintf(screen.detail, sizeof screen.detail, "%s·%s", agent_name_[0] ? agent_name_ : "控制台未绑定",
+                          session_name_[0] ? session_name_ : session_[0] ? "已选会话" : "未选会话");
         }
         if (page_ != Page::kHome) {
             screen.selected = static_cast<int>(cursor_);
-            snprintf(screen.footer, sizeof screen.footer, "Up/Down: choose   Center: select   BOOT: back");
+            snprintf(screen.footer, sizeof screen.footer, "上下键选择  中键确认  BOOT返回");
             if (page_ == Page::kMenu) {
                 snprintf(screen.rows[0], sizeof screen.rows[0], "去医院（查坐车路线）");
                 snprintf(screen.rows[1], sizeof screen.rows[1], "院内科室位置");
-                snprintf(screen.rows[2], sizeof screen.rows[2], "样例路线卡（离线备用）");
-                snprintf(screen.rows[3], sizeof screen.rows[3], "Choose existing conversation");
-                snprintf(screen.rows[4], sizeof screen.rows[4], "Create new conversation");
-                snprintf(screen.rows[5], sizeof screen.rows[5], "Reset platform activation");
+                snprintf(screen.rows[2], sizeof screen.rows[2], "样例路线卡（离线）");
+                snprintf(screen.rows[3], sizeof screen.rows[3], "选择已有会话");
+                snprintf(screen.rows[4], sizeof screen.rows[4], "新建会话");
+                snprintf(screen.rows[5], sizeof screen.rows[5], "重置平台激活");
             } else if (page_ == Page::kReset) {
-                snprintf(screen.rows[0], sizeof screen.rows[0], "Cancel");
-                snprintf(screen.rows[1], sizeof screen.rows[1], "Confirm reset activation");
+                snprintf(screen.rows[0], sizeof screen.rows[0], "取消");
+                snprintf(screen.rows[1], sizeof screen.rows[1], "确认重置激活");
             } else {
                 size_t row = 0;
                 for (; row < count_; ++row)
                     snprintf(screen.rows[row], sizeof screen.rows[row], "%u. %s", static_cast<unsigned>(offset_ + row + 1),
-                             sessions_[row].name[0] ? sessions_[row].name : "Conversation");
-                if (more_) snprintf(screen.rows[row++], sizeof screen.rows[0], "Next page");
-                if (offset_) snprintf(screen.rows[row++], sizeof screen.rows[0], "Previous page");
-                snprintf(screen.rows[row], sizeof screen.rows[row], "Back");
-                if (!count_) snprintf(screen.detail, sizeof screen.detail, "No conversations. Hold center > Create new conversation.");
+                             sessions_[row].name[0] ? sessions_[row].name : "会话");
+                if (more_) snprintf(screen.rows[row++], sizeof screen.rows[0], "下一页");
+                if (offset_) snprintf(screen.rows[row++], sizeof screen.rows[0], "上一页");
+                snprintf(screen.rows[row], sizeof screen.rows[row], "返回");
+                // 列表页不画 detail，所以"没有会话"只能写进页脚，否则这屏只剩一个"返回"，
+                // 老人不知道是没有会话还是加载失败。
+                if (!count_) snprintf(screen.footer, sizeof screen.footer, "还没有会话　长按中键新建");
             }
         } else {
-            snprintf(screen.footer, sizeof screen.footer, "中键说话　长按菜单　上下键音量 %d%%", volume_);
+            // 页脚 28 px 一行只有 440 px。实测"中键说话　长按菜单　上下键音量 60%"要 484 px，
+            // 尾部会被折到屏外，所以缩成 394 px 的写法：保留音量数值，去掉"上下键"三字。
+            snprintf(screen.footer, sizeof screen.footer, "中键说话　长按菜单　音量%d%%", volume_);
         }
         ui_.Publish(screen);
     }
@@ -406,18 +398,21 @@ private:
                     } else if (page_ == Page::kDeptDetail) {
                         page_ = Page::kDeptList; ++view_;
                     } else {
-                        EndCall(); Home(); Message("Call ended. Hold center: menu.");
+                        // 只有"确实在通话"时才报挂断。原来的写法无条件写一句 Call ended，
+                        // 于是从菜单/科室列表按 BOOT 回首页也会弹这行——用户根本没打过电话，
+                        // 看起来就像屏上凭空冒出对话窗口的内部状态。
+                        const bool was_calling = call_;
+                        EndCall(); Home();
+                        if (was_calling) Message("已挂断");
+                        else message_[0] = 0;   // 回首页就清提示，露出"请说一声你好"
                     }
-                } else if (input.action == Action::kProto) {
-                    // 隐藏手势，任何页面都能进，不占菜单
-                    Portrait();
                 } else if (page_ == Page::kHome && (input.action == Action::kUp || input.action == Action::kDown)) {
                     int next = epaper::Volume(volume_, input.action == Action::kUp ? 1 : -1);
                     if (hardware_.AudioReady() && !Error(hardware_.codec.SetVolume(next))) {
                         volume_ = next; volume_dirty = true; volume_at = esp_timer_get_time();
                     }
                 } else if (page_ == Page::kHome && call_ && input.action == Action::kCenter) {
-                    EndCall(); Message("Call ended");
+                    EndCall(); Message("已挂断");
                 } else if (epaper::Current(input.view, view_)) {
                     message_[0] = 0; ++view_;
                     if (input.action == Action::kMenu) {
@@ -435,8 +430,6 @@ private:
                         }
                     } else if (page_ == Page::kDeptDetail) {
                         // 只认 BOOT 返回，其它键忽略，避免在详情页误翻页。
-                    } else if (page_ == Page::kPortrait) {
-                        // 原型页：整屏都是样品文字，除 BOOT 外不接受按键。
                     } else if (page_ == Page::kRoute) {
                         if (input.action == Action::kCenter) {
                             // 失败重试、成功重查走同一条路：RouteStart 自带重入保护，请求中就忽略按键。
@@ -475,10 +468,10 @@ private:
             if (call_) {
                 const agent_state_t state = agent_link_state();
                 if (state == AGENT_STATE_READY) {
-                    if (!active_) { active_ = true; Message("Speak now. Center or BOOT: end call."); }
+                    if (!active_) { active_ = true; Message("请说话，中键挂断"); }
                     audio_.SetContinuous(true);
                 } else if (active_ || state == AGENT_STATE_DISCONNECTED || now - requested_ >= 30000000) {
-                    EndCall(); Message("Call ended or connection failed. Center: retry.");
+                    EndCall(); Message("连接已断，中键重试");
                 }
             }
             if (volume_dirty && now - volume_at >= 1000000) { Save(); volume_dirty = false; }
@@ -498,10 +491,8 @@ private:
                 down[i] = pressed;
                 const epaper::Press press = keys[i].Poll(pressed, now);
                 if (press == epaper::Press::kNone) continue;
-                // 长按上键是隐藏入口：竖屏原型。不占菜单，不影响任何可见界面。
-                Action action = i == 0 ? (press == epaper::Press::kHold ? Action::kProto : Action::kUp)
-                              : i == 1 ? Action::kDown : i == 3 ? Action::kBack
-                              : press == epaper::Press::kHold ? Action::kMenu : Action::kCenter;
+                Action action = i == 0 ? Action::kUp : i == 1 ? Action::kDown : i == 3 ? Action::kBack :
+                                press == epaper::Press::kHold ? Action::kMenu : Action::kCenter;
                 Input input{action, pressed_view[i]};
                 if (xQueueSend(events_, &input, 0) != pdTRUE) ESP_LOGW(TAG, "Input busy");
             }
