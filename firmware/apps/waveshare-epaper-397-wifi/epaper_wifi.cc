@@ -5,8 +5,8 @@
 #include "epaper_wifi_ui.h"
 #include "epaper_controls.h"
 #include "agent_link_platform.h"
-#include "route_card.h"
 #include "dept_table.h"
+#include "route_card.h"
 
 #include <cstdio>
 #include <cstring>
@@ -23,8 +23,8 @@ constexpr const char* TAG = "WS397.wifi";
 // 绘制层有 11 个物理行槽（ui.cc 的 kBodyRows）。35 px 正文一条逻辑行能放 12 个汉字，
 // 实测 7 条文案全部单行放下；留 2 个槽给偶发折行，所以一页排 9 条逻辑行。
 constexpr int kRouteRowsPerPage = 9;
-constexpr int kDeptRowsPerPage = 10;   // 科室名 4–5 字，40 px 一屏 10 条（与 ui.cc 的 kListRows 对齐）
-enum class Page { kHome, kMenu, kSessions, kReset, kRoute, kDeptList, kDeptDetail };
+constexpr int kDeptRowsPerPage = 9;
+enum class Page { kHome, kMenu, kSettings, kSessions, kReset, kRoute, kDeptList, kDeptDetail, kDeptHint };
 enum class Action { kUp, kDown, kCenter, kMenu, kBack };
 struct Input { Action action; uint32_t view; };
 }
@@ -65,6 +65,7 @@ public:
     // 这决定了"AI 决定后自动导航"这条路是否成立。
     void ShowText(const char* text) override {
         ESP_LOGI(TAG, "voice text: %s", text ? text : "(null)");
+        RememberSpeech(text);
         ui_.Answer(text);
     }
     void PlayAudio(const uint8_t* pcm, size_t bytes) override { audio_.Play(pcm, bytes); }
@@ -85,6 +86,13 @@ private:
         if (nvs_get_i32(handle, "volume", &volume) == ESP_OK && volume >= 0 && volume <= 100) volume_ = volume;
         nvs_close(handle);
         if (saved_agent_ <= 0) session_[0] = session_name_[0] = 0;
+#if CONFIG_AGENT_LINK_REALTIME_DIRECT
+        // 直连验收固件：语音与路线卡必须共用 TiDB Link 会话，不能误读 NVS 里的旧平台会话。
+        snprintf(session_, sizeof session_, "%s", CONFIG_AGENT_LINK_REALTIME_SESSION_ID);
+        snprintf(session_name_, sizeof session_name_, "TiDB Link 语音验收");
+        snprintf(agent_name_, sizeof agent_name_, "TiDB Link 直连");
+        voice_ = true;
+#endif
     }
     void Save() {
         nvs_handle_t handle;
@@ -105,14 +113,30 @@ private:
     }
     void Home() { page_ = Page::kHome; cursor_ = 0; ++view_; }
     void EndCall() {
+        const bool was_call = call_;
         call_ = active_ = false; requested_ = 0;
         audio_.Stop(); (void)agent_link_end_realtime();
         // 上一轮对话的回复属于"这次通话"，不是首页的一部分。不清掉的话，
         // 按 BOOT 退出通话后首页会同时写着"请说一声你好"和上一轮的整段回答，
         // 老人会以为那是当前要说的话。Ui 那边同时会在回复消失时强制全刷，擦掉残影。
         ui_.Answer("");
+        // 通话期间探针发现新卡时，挂断动作本身就是“确认看路线”，直接切页；
+        // 仍保留长按菜单作为没有新卡时的兜底入口。
+        if (was_call && auto_route_pending_ && page_ == Page::kHome) {
+            auto_route_pending_ = false;
+            ESP_LOGI(TAG, "auto route: switching after call end");
+            RealRoute();
+        }
     }
     bool SyncAgent(bool explain = false) {
+#if CONFIG_AGENT_LINK_REALTIME_DIRECT
+        (void)explain;
+        snprintf(session_, sizeof session_, "%s", CONFIG_AGENT_LINK_REALTIME_SESSION_ID);
+        snprintf(session_name_, sizeof session_name_, "TiDB Link 语音验收");
+        snprintf(agent_name_, sizeof agent_name_, "TiDB Link 直连");
+        voice_ = true;
+        return true;
+#else
         agent_link_platform_agent_t bound{};
         const esp_err_t error = agent_link_platform_bound_agent(&bound);
         if (error != ESP_OK) {
@@ -137,6 +161,7 @@ private:
         snprintf(agent_name_, sizeof agent_name_, "%s", bound.name);
         voice_ = bound.voice_supported;
         return true;
+#endif
     }
     void Busy(const char* title) {
         epaper::Screen screen{}; screen.view = ++view_;
@@ -211,8 +236,241 @@ private:
         route_page_ = 0;
         page_ = Page::kRoute; cursor_ = 0; ++view_;
         message_[0] = 0;
-        RouteStart(&route_view_);
-        ESP_LOGI(TAG, "route: request started");
+        RouteStart(&route_view_, session_[0] ? session_ : nullptr);
+        ESP_LOGI(TAG, "route: request started%s", session_[0] ? " for selected session" : " using demo endpoint");
+    }
+    // 路线卡标题里只有医院，没有科室。这里按四家核准医院的简称匹配静态科室表；
+    // 不匹配时明确显示“未收录”，绝不拿中山的楼层去冒充仁济。
+    const char* RouteHospitalKey() const {
+        const char* title = route_view_.title;
+        if (strstr(title, "中山")) return "中山";
+        if (strstr(title, "第六") || strstr(title, "市六")) return "市六";
+        if (strstr(title, "仁济")) return "仁济";
+        if (strstr(title, "肿瘤")) return "肿瘤";
+        return "";
+    }
+    int DeptCountForKey(const char* key) const {
+        if (!key || !*key) return 0;
+        int count = 0;
+        for (int i = 0; i < kDepartmentCount; ++i)
+            if (strcmp(kDepartments[i].hospital_key, key) == 0) ++count;
+        return count;
+    }
+    const DeptEntry* DeptAt(const char* key, int ordinal) const {
+        if (!key || !*key || ordinal < 0) return nullptr;
+        for (int i = 0; i < kDepartmentCount; ++i) {
+            if (strcmp(kDepartments[i].hospital_key, key) != 0) continue;
+            if (ordinal-- == 0) return &kDepartments[i];
+        }
+        return nullptr;
+    }
+    // partial 文本会反复下发同一句的增长版：本次以已有内容开头时直接覆盖，否则追加。
+    // 这样既能拼出多段回复，又不会被 partial 重复撑爆缓冲。
+    void RememberSpeech(const char* text) {
+        if (!text || !*text) return;
+        const size_t len = strlen(text);
+        const size_t cur = strlen(spoken_);
+        if (cur > 0 && len > cur && strncmp(text, spoken_, cur) == 0) {
+            snprintf(spoken_, sizeof spoken_, "%s", text);
+            return;
+        }
+        if (len >= sizeof spoken_) {
+            snprintf(spoken_, sizeof spoken_, "%s", text + (len - sizeof spoken_ + 1));
+            return;
+        }
+        if (cur + len + 1 > sizeof spoken_) {
+            const size_t drop = cur + len + 1 - sizeof spoken_;
+            memmove(spoken_, spoken_ + drop, cur - drop + 1);
+        }
+        const size_t used = strlen(spoken_);
+        snprintf(spoken_ + used, sizeof spoken_ - used, "%s", text);
+    }
+
+    static const char* LastHit(const char* text, const char* needle) {
+        if (!text || !*text || !needle || !*needle) return nullptr;
+        const char* last = nullptr;
+        for (const char* hit = strstr(text, needle); hit; hit = strstr(hit + 1, needle)) last = hit;
+        return last;
+    }
+
+    // 人设说的是“消化内科、呼吸内科”，科室表里存的是“肠胃科、呼吸科”，
+    // 所以别名必须在这里补齐，否则永远匹配不上。
+    const char* DeptLatestMention(const char* name) const {
+        struct Alias { const char* name; const char* extra[3]; };
+        static const Alias kAlias[] = {
+            {"肠胃科", {"消化内科", "消化科", nullptr}},
+            {"呼吸科", {"呼吸内科", nullptr, nullptr}},
+            {"心内科", {"心血管内科", "心脏内科", nullptr}},
+            {"肾内科", {"肾脏内科", nullptr, nullptr}},
+            {"普外科", {"普通外科", "普外科", nullptr}},
+            {"神经内科", {"神经内科", nullptr, nullptr}},
+            {"内分泌科", {"内分泌", nullptr, nullptr}},
+            {"骨科", {"骨外科", nullptr, nullptr}},
+            {"肿瘤科", {"肿瘤内科", "肿瘤外科", nullptr}},
+        };
+        const char* latest = LastHit(spoken_, name);
+        for (const Alias& alias : kAlias) {
+            if (strcmp(alias.name, name) != 0) continue;
+            for (const char* extra : alias.extra) {
+                if (!extra) break;
+                const char* hit = LastHit(spoken_, extra);
+                if (hit && (!latest || hit > latest)) latest = hit;
+            }
+        }
+        return latest;
+    }
+
+    // 交通页长按：语音已经推荐了科室，就直接打开那个科室，不再让老人上下键翻全院列表。
+    // 认不出来（或该院没有这个科）才退回列表，绝不猜一个科显示楼层。
+    void DeptForRoute() {
+        // 语音说了"分不清、去服务台"时，文中即便出现科名也只是鉴别诊断的可能性，
+        // 不能当成推荐科室，否则会和刚播完的医嘱自相矛盾。
+        static const char* const kNoDept[] = {"服务台", "分不清", "都有点关系", "都可能", "没有排名"};
+        for (const char* word : kNoDept) {
+            if (strstr(spoken_, word)) {
+                ESP_LOGW(TAG, "dept: speech says no clear department (%s)", word);
+                DeptHint();
+                return;
+            }
+        }
+        const char* key = RouteHospitalKey();
+        int best = -1;
+        const char* best_at = nullptr;
+        int ordinal = -1;
+        for (int i = 0; i < kDepartmentCount; ++i) {
+            if (strcmp(kDepartments[i].hospital_key, key) != 0) continue;
+            ++ordinal;
+            const char* at = DeptLatestMention(kDepartments[i].name);
+            if (!at) continue;
+            // 取最后被提到的科：Agent 先列备选再给结论时，结论在最后一句。
+            if (!best_at || at > best_at) { best_at = at; best = ordinal; }
+        }
+        if (best < 0) {
+            // 语音里没有明确科室（例如"分不清，建议去一楼服务台"）时，绝不能列出全院科室
+            // 让老人自己挑：那等于替他分诊，而且会和刚说完的医嘱自相矛盾。
+            ESP_LOGW(TAG, "dept: no department mentioned, showing service-desk hint");
+            DeptHint();
+            return;
+        }
+        const DeptEntry* entry = DeptAt(key, best);
+        dept_cursor_ = dept_selected_ = best;
+        page_ = Page::kDeptDetail;
+        cursor_ = 0;
+        ++view_;
+        message_[0] = 0;
+        ESP_LOGI(TAG, "dept: direct open hospital=%s name=%s", key, entry ? entry->name : "?");
+    }
+
+    void DeptHint() {
+        page_ = Page::kDeptHint;
+        cursor_ = 0;
+        ++view_;
+        message_[0] = 0;
+    }
+    void PublishDeptHint(epaper::Screen& screen) {
+        snprintf(screen.title, sizeof screen.title, "院内位置");
+        screen.row_scale = 2;
+        snprintf(screen.rows[0], sizeof screen.rows[0], "这次没定科室");
+        snprintf(screen.rows[1], sizeof screen.rows[1], "请到一楼服务台问");
+        snprintf(screen.detail, sizeof screen.detail, "自己猜科室容易走错");
+        snprintf(screen.footer, sizeof screen.footer, "中键看科室位置  BOOT返回");
+    }
+
+    void DeptList() {
+        dept_cursor_ = 0;
+        page_ = Page::kDeptList;
+        cursor_ = 0;
+        ++view_;
+        message_[0] = 0;
+        ESP_LOGI(TAG, "dept: list opened hospital=%s entries=%d", RouteHospitalKey(),
+                 DeptCountForKey(RouteHospitalKey()));
+    }
+    void PublishDeptList(epaper::Screen& screen) {
+        const char* key = RouteHospitalKey();
+        const int count = DeptCountForKey(key);
+        snprintf(screen.title, sizeof screen.title, "%s科室", key && *key ? key : "该院");
+        if (!count) {
+            snprintf(screen.rows[0], sizeof screen.rows[0], "该院科室信息未收录");
+            snprintf(screen.detail, sizeof screen.detail, "以现场导医信息为准");
+            snprintf(screen.footer, sizeof screen.footer, "BOOT返回");
+            return;
+        }
+        if (dept_cursor_ >= count) dept_cursor_ = count - 1;
+        const int start = (dept_cursor_ / kDeptRowsPerPage) * kDeptRowsPerPage;
+        int row = 0;
+        for (int i = start; i < count && row < kDeptRowsPerPage; ++i, ++row) {
+            const DeptEntry* dept = DeptAt(key, i);
+            if (dept) snprintf(screen.rows[row], sizeof screen.rows[row], "%d. %s", i + 1, dept->name);
+        }
+        screen.selected = dept_cursor_ - start;
+        snprintf(screen.detail, sizeof screen.detail, "第 %d-%d 项，共 %d 项", start + 1, start + row, count);
+        snprintf(screen.footer, sizeof screen.footer, "上下键选择  中键查看  BOOT返回");
+    }
+    void PublishDept(epaper::Screen& screen) {
+        const char* key = RouteHospitalKey();
+        const DeptEntry* dept = DeptAt(key, dept_selected_);
+        if (!dept) {
+            snprintf(screen.title, sizeof screen.title, "科室信息");
+            snprintf(screen.rows[0], sizeof screen.rows[0], "该院科室信息未收录");
+            snprintf(screen.footer, sizeof screen.footer, "BOOT返回");
+            return;
+        }
+        snprintf(screen.title, sizeof screen.title, "%s", dept->name);
+        screen.row_scale = 2;
+        for (int i = 0; i < 5; ++i)
+            if (dept->lines[i]) snprintf(screen.rows[i], sizeof screen.rows[i], "%s", dept->lines[i]);
+        snprintf(screen.detail, sizeof screen.detail, "%s", dept->hours);
+        snprintf(screen.footer, sizeof screen.footer, "以现场为准  BOOT返回");
+    }
+
+    // 通话期间只做“版本探针”，不显示卡片；用户挂断时若探针发现新版本，
+    // 直接进入路线页。这样不需要长按菜单和短按确认，也不会在语音播报中切页。
+    void StartAutoRoute() {
+        auto_card_ = RouteCard{};
+        auto_baseline_version_ = 0;
+        auto_baseline_ready_ = false;
+        auto_route_pending_ = false;
+        auto_next_probe_us_ = 0;
+    }
+    void ObserveAutoRoute() {
+        if (!auto_baseline_ready_) {
+            auto_baseline_version_ = auto_card_.state == RouteCard::State::kOk ? auto_card_.version : 0;
+            auto_baseline_ready_ = true;
+            ESP_LOGI(TAG, "auto route baseline version=%u", static_cast<unsigned>(auto_baseline_version_));
+            return;
+        }
+        if (auto_card_.version && auto_card_.version != auto_baseline_version_) {
+            auto_route_pending_ = true;
+            ESP_LOGI(TAG, "auto route new version=%u (baseline=%u)",
+                     static_cast<unsigned>(auto_card_.version), static_cast<unsigned>(auto_baseline_version_));
+        }
+    }
+    void PollAutoRoute() {
+        if (!call_ || page_ != Page::kHome || auto_route_pending_) return;
+        if (auto_card_.state == RouteCard::State::kOk) {
+            ObserveAutoRoute();
+            auto_card_.state = RouteCard::State::kIdle;
+            if (auto_route_pending_) return;
+        } else if (auto_card_.state == RouteCard::State::kFailed) {
+            // HTTP 成功但服务端明确没有卡（code=3）可以建立 0 基线；
+            // 网络失败不建立基线，避免把下一次恢复误当成新路线。
+            if (auto_card_.error == ESP_OK && !auto_baseline_ready_) {
+                ObserveAutoRoute();
+            }
+            auto_card_.state = RouteCard::State::kIdle;
+        } else if (auto_card_.state == RouteCard::State::kLoading) {
+            return;
+        }
+
+        const int64_t now = esp_timer_get_time();
+        if (now < auto_next_probe_us_) return;
+        auto_card_.state = RouteCard::State::kLoading;
+        if (RouteStart(&auto_card_, session_[0] ? session_ : nullptr)) {
+            auto_next_probe_us_ = now + 2000000;  // 2 秒一次，足够快但不会刷爆接口
+        } else {
+            auto_card_.state = RouteCard::State::kIdle;
+            auto_next_probe_us_ = now + 1000000;
+        }
     }
     int RoutePages() const {
         if (route_view_.count <= 0) return 1;
@@ -247,40 +505,14 @@ private:
             snprintf(screen.footer, sizeof screen.footer, "%d/%d 页  上下键翻页  BOOT返回",
                      route_page_ + 1, pages);
         else
-            snprintf(screen.footer, sizeof screen.footer, "中键重查  BOOT返回");
-    }
-    // 院内科室：先列表选科室，再出大字卡。数据是开机就在闪存里的静态表，离线可查。
-    void DeptList() {
-        EndCall();
-        dept_cursor_ = 0;
-        page_ = Page::kDeptList; ++view_;
-        message_[0] = 0;
-        ESP_LOGI(TAG, "dept: list opened, %d entries", kDepartmentCount);
-    }
-    void PublishDeptList(epaper::Screen& screen) {
-        const int start = (dept_cursor_ / kDeptRowsPerPage) * kDeptRowsPerPage;
-        int row = 0;
-        for (int i = 0; i < kDeptRowsPerPage && start + i < kDepartmentCount; ++i, ++row)
-            snprintf(screen.rows[row], sizeof screen.rows[row], "%d. %s", start + i + 1,
-                     kDepartments[start + i].name);
-        screen.selected = dept_cursor_ - start;
-        snprintf(screen.title, sizeof screen.title, "中山医院科室");
-        snprintf(screen.detail, sizeof screen.detail, "第 %d-%d 项，共 %d 项", start + 1, start + row,
-                 kDepartmentCount);
-        snprintf(screen.footer, sizeof screen.footer, "上下键选择  中键查看  BOOT返回");
-    }
-    void PublishDept(epaper::Screen& screen) {
-        if (dept_selected_ < 0 || dept_selected_ >= kDepartmentCount) return;
-        const DeptEntry& dept = kDepartments[dept_selected_];
-        snprintf(screen.title, sizeof screen.title, "%s", dept.name);
-        screen.row_scale = 2;
-        for (int i = 0; i < 5; ++i)
-            if (dept.lines[i]) snprintf(screen.rows[i], sizeof screen.rows[i], "%s", dept.lines[i]);
-        snprintf(screen.detail, sizeof screen.detail, "%s", dept.hours);
-        snprintf(screen.footer, sizeof screen.footer, "静态表·以现场为准·BOOT返回");
+            snprintf(screen.footer, sizeof screen.footer, "中键刷新  长按科室  BOOT返回");
     }
     void Call() {
-        if (call_) { EndCall(); Message("已挂断"); return; }
+        if (call_) {
+            EndCall();
+            if (page_ != Page::kRoute) Message("长按中键，再选去医院");
+            return;
+        }
         if (!SyncAgent(true)) return;
         if (!session_[0]) { Sessions(); return; }
         if (!voice_) { Message("该智能体不支持语音"); return; }
@@ -288,8 +520,16 @@ private:
         const agent_state_t state = agent_link_state();
         if (state != AGENT_STATE_CONNECTED && state != AGENT_STATE_READY) { Message("正在等待平台连接"); return; }
         ui_.Answer("");
-        if (!Error(agent_link_request_realtime_session(agent_, session_))) {
+#if CONFIG_AGENT_LINK_REALTIME_DIRECT
+        const esp_err_t request = agent_link_request_realtime();
+#else
+        const esp_err_t request = agent_link_request_realtime_session(agent_, session_);
+#endif
+        if (!Error(request)) {
             call_ = true; active_ = false; requested_ = esp_timer_get_time();
+            // 每次通话独立累积：上一轮推荐的科室不能串到这一轮。
+            spoken_[0] = 0;
+            StartAutoRoute();
             Message("接通中，中键挂断");
         }
     }
@@ -297,11 +537,30 @@ private:
         if (page_ == Page::kHome) { Call(); return; }
         if (page_ == Page::kMenu) {
             if (cursor_ == 0) RealRoute();
-            else if (cursor_ == 1) DeptList();
-            else if (cursor_ == 2) SampleRoute();
-            else if (cursor_ == 3) Sessions();
-            else if (cursor_ == 4) NewSession();
-            else if (cursor_ == 5) { page_ = Page::kReset; cursor_ = 0; ++view_; }
+#if !CONFIG_AGENT_LINK_REALTIME_DIRECT
+            else if (cursor_ == 1) { page_ = Page::kSettings; cursor_ = 0; ++view_; }
+#endif
+        } else if (page_ == Page::kDeptHint) {
+            // 提示页只是"别自己猜"，老人自己知道科名时仍可进列表查位置。
+            DeptList();
+        } else if (page_ == Page::kDeptList) {
+            if (DeptCountForKey(RouteHospitalKey()) > 0) {
+                dept_selected_ = dept_cursor_;
+                page_ = Page::kDeptDetail;
+                ++view_;
+                ESP_LOGI(TAG, "dept: open %d", dept_selected_);
+            }
+        } else if (page_ == Page::kDeptDetail) {
+            // 详情页只认 BOOT 返回，中键不重复进入。
+        } else if (page_ == Page::kSettings) {
+#if !CONFIG_AGENT_LINK_REALTIME_DIRECT
+            if (cursor_ == 0) SampleRoute();
+            else if (cursor_ == 1) Sessions();
+            else if (cursor_ == 2) NewSession();
+            else if (cursor_ == 3) { page_ = Page::kReset; cursor_ = 0; ++view_; }
+#else
+            Home();
+#endif
         } else if (page_ == Page::kReset) {
             if (cursor_ == 1) {
                 EndCall();
@@ -325,8 +584,21 @@ private:
         }
     }
     size_t Rows() const {
-        if (page_ == Page::kMenu) return 6;
+        if (page_ == Page::kMenu) {
+#if CONFIG_AGENT_LINK_REALTIME_DIRECT
+            return 1;
+#else
+            return 2;
+#endif
+        }
+        if (page_ == Page::kSettings) return 4;
         if (page_ == Page::kReset) return 2;
+        if (page_ == Page::kDeptList) {
+            const int count = DeptCountForKey(RouteHospitalKey());
+            return count > 0 ? static_cast<size_t>(count) : 1;
+        }
+        if (page_ == Page::kDeptDetail) return 1;
+        if (page_ == Page::kDeptHint) return 1;
         return count_ + (more_ ? 1 : 0) + (offset_ ? 1 : 0) + 1;
     }
     void Publish() {
@@ -334,16 +606,18 @@ private:
         if (page_ == Page::kRoute) { PublishRoute(screen); ui_.Publish(screen); return; }
         if (page_ == Page::kDeptList) { PublishDeptList(screen); ui_.Publish(screen); return; }
         if (page_ == Page::kDeptDetail) { PublishDept(screen); ui_.Publish(screen); return; }
+        if (page_ == Page::kDeptHint) { PublishDeptHint(screen); ui_.Publish(screen); return; }
         if (CLOUD_PRODUCT_ID <= 0) {
             snprintf(screen.title, sizeof screen.title, "未配置平台产品 ID");
             snprintf(screen.detail, sizeof screen.detail, "请在 products.json 注册本机型后重编");
         } else {
-            snprintf(screen.title, sizeof screen.title, "%s", page_ == Page::kMenu ? "菜单" :
-                     page_ == Page::kSessions ? "选择会话" : page_ == Page::kReset ? "重置激活？" :
+            snprintf(screen.title, sizeof screen.title, "%s", page_ == Page::kMenu ? "就医通" :
+                     page_ == Page::kSettings ? "设备设置" : page_ == Page::kSessions ? "选择会话" :
+                     page_ == Page::kReset ? "重置激活？" :
                      active_ ? "请说话" : call_ ? "正在接通" : "就医通");
             if (page_ == Page::kReset) snprintf(screen.detail, sizeof screen.detail, "WiFi 保留，先在控制台解绑");
             else if (message_[0]) snprintf(screen.detail, sizeof screen.detail, "%s", message_);
-            else if (page_ == Page::kHome) snprintf(screen.detail, sizeof screen.detail, "请说一声你好");
+            else if (page_ == Page::kHome) snprintf(screen.detail, sizeof screen.detail, "按中键开始，说哪里不舒服");
             else snprintf(screen.detail, sizeof screen.detail, "%s·%s", agent_name_[0] ? agent_name_ : "控制台未绑定",
                           session_name_[0] ? session_name_ : session_[0] ? "已选会话" : "未选会话");
         }
@@ -351,12 +625,17 @@ private:
             screen.selected = static_cast<int>(cursor_);
             snprintf(screen.footer, sizeof screen.footer, "上下键选择  中键确认  BOOT返回");
             if (page_ == Page::kMenu) {
-                snprintf(screen.rows[0], sizeof screen.rows[0], "去医院（查坐车路线）");
-                snprintf(screen.rows[1], sizeof screen.rows[1], "院内科室位置");
-                snprintf(screen.rows[2], sizeof screen.rows[2], "样例路线卡（离线）");
-                snprintf(screen.rows[3], sizeof screen.rows[3], "选择已有会话");
-                snprintf(screen.rows[4], sizeof screen.rows[4], "新建会话");
-                snprintf(screen.rows[5], sizeof screen.rows[5], "重置平台激活");
+                snprintf(screen.rows[0], sizeof screen.rows[0], "去医院（查看路线）");
+#if CONFIG_AGENT_LINK_REALTIME_DIRECT
+                snprintf(screen.footer, sizeof screen.footer, "中键查看路线  BOOT返回");
+#else
+                snprintf(screen.rows[1], sizeof screen.rows[1], "设备设置");
+            } else if (page_ == Page::kSettings) {
+                snprintf(screen.rows[0], sizeof screen.rows[0], "样例路线卡（离线自检）");
+                snprintf(screen.rows[1], sizeof screen.rows[1], "选择已有会话");
+                snprintf(screen.rows[2], sizeof screen.rows[2], "新建会话");
+                snprintf(screen.rows[3], sizeof screen.rows[3], "重置平台激活");
+#endif
             } else if (page_ == Page::kReset) {
                 snprintf(screen.rows[0], sizeof screen.rows[0], "取消");
                 snprintf(screen.rows[1], sizeof screen.rows[1], "确认重置激活");
@@ -375,7 +654,11 @@ private:
         } else {
             // 页脚 28 px 一行只有 440 px。实测"中键说话　长按菜单　上下键音量 60%"要 484 px，
             // 尾部会被折到屏外，所以缩成 394 px 的写法：保留音量数值，去掉"上下键"三字。
+#if CONFIG_AGENT_LINK_REALTIME_DIRECT
+            snprintf(screen.footer, sizeof screen.footer, "中键说话　长按路线　音量%d%%", volume_);
+#else
             snprintf(screen.footer, sizeof screen.footer, "中键说话　长按菜单　音量%d%%", volume_);
+#endif
         }
         ui_.Publish(screen);
     }
@@ -387,9 +670,7 @@ private:
             if (xQueueReceive(events_, &input, pdMS_TO_TICKS(50)) == pdTRUE) {
                 // Ending a call and changing volume remain usable while e-paper is refreshing.
                 if (input.action == Action::kBack) {
-                    // BOOT 逐级返回：科室详情 → 科室列表 → 主页。只有回到主页才结束通话。
-                    // 通话中必须随时能挂断，所以通话态不设门控；纯页面导航则和其它键一样等屏幕刷完，
-                    // 否则屏还在刷（2.45 s）时再按一次会连跳两级，看起来像"没逐级返回"。
+                    // BOOT 逐级返回。通话中必须随时能挂断；页面导航仍等当前刷屏完成，防止连跳。
                     const bool stale = !call_ && !epaper::Current(input.view, view_);
                     ESP_LOGI(TAG, "key: BOOT page=%d call=%d stale=%d", static_cast<int>(page_),
                              call_ ? 1 : 0, stale ? 1 : 0);
@@ -397,14 +678,23 @@ private:
                         // 丢弃：这一次按键属于上一屏，不处理
                     } else if (page_ == Page::kDeptDetail) {
                         page_ = Page::kDeptList; ++view_;
+                    } else if (page_ == Page::kDeptList) {
+                        page_ = Page::kRoute; ++view_;
+                    } else if (page_ == Page::kDeptHint) {
+                        page_ = Page::kRoute; ++view_;
+                    } else if (page_ == Page::kSettings) {
+                        page_ = Page::kMenu; cursor_ = 0; ++view_;
+                    } else if (page_ == Page::kSessions || page_ == Page::kReset) {
+                        page_ = Page::kSettings; cursor_ = 0; ++view_;
                     } else {
-                        // 只有"确实在通话"时才报挂断。原来的写法无条件写一句 Call ended，
-                        // 于是从菜单/科室列表按 BOOT 回首页也会弹这行——用户根本没打过电话，
-                        // 看起来就像屏上凭空冒出对话窗口的内部状态。
                         const bool was_calling = call_;
-                        EndCall(); Home();
+                        EndCall();
+                        // BOOT 的语义始终是“回到首页”。EndCall 可能因为自动切页
+                        // 把 page_ 改成 kRoute，这里必须再 Home 一次，否则交通页
+                        // 会吞掉 BOOT，用户看起来像按键失效。
+                        Home();
                         if (was_calling) Message("已挂断");
-                        else message_[0] = 0;   // 回首页就清提示，露出"请说一声你好"
+                        else message_[0] = 0;
                     }
                 } else if (page_ == Page::kHome && (input.action == Action::kUp || input.action == Action::kDown)) {
                     int next = epaper::Volume(volume_, input.action == Action::kUp ? 1 : -1);
@@ -412,24 +702,22 @@ private:
                         volume_ = next; volume_dirty = true; volume_at = esp_timer_get_time();
                     }
                 } else if (page_ == Page::kHome && call_ && input.action == Action::kCenter) {
-                    EndCall(); Message("已挂断");
+                    EndCall();
+                    if (page_ != Page::kRoute) Message("长按中键，再选去医院");
                 } else if (epaper::Current(input.view, view_)) {
                     message_[0] = 0; ++view_;
                     if (input.action == Action::kMenu) {
-                        EndCall(); page_ = Page::kMenu; cursor_ = 0;
-                    } else if (page_ == Page::kDeptList) {
-                        if (input.action == Action::kCenter) {
-                            dept_selected_ = dept_cursor_;
-                            page_ = Page::kDeptDetail; ++view_;
-                            ESP_LOGI(TAG, "dept: open %d '%s'", dept_selected_,
-                                     kDepartments[dept_selected_].name);
-                        } else if (input.action == Action::kUp) {
-                            dept_cursor_ = (dept_cursor_ + kDepartmentCount - 1) % kDepartmentCount;
-                        } else if (input.action == Action::kDown) {
-                            dept_cursor_ = (dept_cursor_ + 1) % kDepartmentCount;
+                        if (page_ == Page::kRoute) {
+                            DeptForRoute();
+                        } else if (page_ == Page::kDeptList || page_ == Page::kDeptDetail) {
+                            // 科室页不重复叠菜单，BOOT 才是返回键。
+                        } else {
+                            EndCall();
+                            if (page_ != Page::kRoute) {
+                                page_ = Page::kMenu;
+                                cursor_ = 0;
+                            }
                         }
-                    } else if (page_ == Page::kDeptDetail) {
-                        // 只认 BOOT 返回，其它键忽略，避免在详情页误翻页。
                     } else if (page_ == Page::kRoute) {
                         if (input.action == Action::kCenter) {
                             // 失败重试、成功重查走同一条路：RouteStart 自带重入保护，请求中就忽略按键。
@@ -449,8 +737,19 @@ private:
                                 ESP_LOGI(TAG, "route: page %d/%d", route_page_ + 1, pages);
                             }
                         }
-                    } else if (input.action == Action::kCenter) Choose();
-                    else if (page_ != Page::kHome) {
+                    } else if (input.action == Action::kCenter) {
+                        Choose();
+                    } else if (page_ == Page::kDeptList) {
+                        const int count = DeptCountForKey(RouteHospitalKey());
+                        if (count > 0 && (input.action == Action::kUp || input.action == Action::kDown)) {
+                            dept_cursor_ = input.action == Action::kUp ? (dept_cursor_ + count - 1) % count
+                                                                       : (dept_cursor_ + 1) % count;
+                            cursor_ = dept_cursor_;
+                            ++view_;
+                        }
+                    } else if (page_ == Page::kDeptDetail) {
+                        // 详情页只认 BOOT 返回。
+                    } else if (page_ != Page::kHome) {
                         const size_t rows = Rows();
                         cursor_ = input.action == Action::kUp ? (cursor_ + rows - 1) % rows : (cursor_ + 1) % rows;
                     }
@@ -475,6 +774,7 @@ private:
                 }
             }
             if (volume_dirty && now - volume_at >= 1000000) { Save(); volume_dirty = false; }
+            PollAutoRoute();
             Publish();
         }
     }
@@ -519,8 +819,17 @@ private:
     uint32_t view_ = 1;
     int64_t requested_ = 0;
     RouteCard route_view_{};
+    RouteCard auto_card_{};
+    uint32_t auto_baseline_version_ = 0;
+    bool auto_baseline_ready_ = false;
+    bool auto_route_pending_ = false;
+    int64_t auto_next_probe_us_ = 0;
     int route_page_ = 0;
-    int dept_cursor_ = 0, dept_selected_ = 0;
+    int dept_cursor_ = 0;
+    int dept_selected_ = 0;
+    // 本轮语音回复的文本。科室楼层本来就在固件的静态表里，不需要再从云端取；
+    // 缺的只有“这次该看哪个科”，而这句话 Agent 已经在语音里说过，本地认出来即可。
+    char spoken_[900] = {};
 };
 
 DECLARE_APPLICATION(WaveshareEpaperWifi);

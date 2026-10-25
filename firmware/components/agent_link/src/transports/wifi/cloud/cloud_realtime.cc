@@ -40,10 +40,23 @@ using namespace agentlink::cloud_limits;
 constexpr const char* TAG = "agent_link.realtime";
 constexpr int kConnectTimeoutMs = 10000;
 constexpr size_t kMicBytes = 640;
-constexpr size_t kUplinkBatchBytes = kMicBytes * kUplinkBatchPackets;
+// 6.8 KB 的整批上行在 TCP 发送窗口收紧时更容易卡到 1 秒。缩到 4 帧（约 3.4 KB）
+// 降低单次写事务的粒度；这不是带宽优化，是为了避免一次大写入把整条会话拖死。
+constexpr size_t kRealtimeBatchPackets = 4;
+constexpr size_t kUplinkBatchBytes = kMicBytes * kRealtimeBatchPackets;
+// 1000 ms 会被 TCP 的一次重传周期误伤，先给 3 秒让链路自行恢复；仍失败才交给
+// 上层做有界重连。阻塞期间下行有 32 KB 接收缓冲兜底，不会立刻丢音频。
+constexpr int kSendTimeoutMs = 3000;
 constexpr char kAudioPrefix[] = "{\"type\":\"input_audio.append\",\"audio\":\"";
 constexpr size_t kAudioJsonBytes = sizeof(kAudioPrefix) - 1 + (kUplinkBatchBytes + 2) / 3 * 4 + 3;
 constexpr int64_t kReadyTimeoutUs = 10000000;
+// 多轮采集后，实时模型可能在复述前长时间没有下行事件。45 秒会把“仍在生成”误判成断线；
+// 保留 3 分钟有界等待，期间用户仍可按中键主动挂断，避免把长生成当成永久卡死。
+constexpr int64_t kRxIdleTimeoutUs = 180000000;
+// 回复期间上行仍全速推送，会在服务端生成较长语音时把 TCP 发送缓冲顶满。
+// 发送阻塞超过 1 秒会直接断开 WSS，因此回复期间暂停麦克风上行；即使收不到
+// response.audio.done，也在 90 秒后恢复，避免永久静音。
+constexpr int64_t kUplinkPauseLimitUs = 90000000;
 
 struct Grant {
     char url[512];
@@ -55,6 +68,10 @@ struct Grant {
     int agent_id;
     char session_id[80];
 };
+
+// Platform and TiDB Link direct calls both support server-side endpointing.
+// Only externally offered grants retain the explicit client activity protocol.
+bool ServerEndpointing(const Grant& grant) { return grant.platform || grant.direct; }
 
 enum class TxKind { kStart, kPcm, kEnd };
 struct Tx {
@@ -91,12 +108,21 @@ struct WssAddress {
     int  port = 443;
 };
 
+enum class EndReason {
+    kDone,
+    kCancelled,
+    kTransport,
+    kServer,
+    kTimeout,
+};
+
 QueueHandle_t              s_grants = nullptr;
 bool                       s_grants_caps = false;
 std::atomic<TaskHandle_t>  s_task{nullptr};
 std::atomic<bool>          s_run{false};
 std::atomic<bool>          s_ready{false};
 std::atomic<bool>          s_mute{false};
+std::atomic<bool>          s_uplink_paused{false};
 std::atomic<bool>          s_continuous{false};
 std::atomic<uint32_t>      s_epoch{0};
 std::atomic<uint32_t>      s_reset{0};
@@ -145,12 +171,13 @@ void ReportUplink() {
     constexpr const char* phases[] = {"loop", "send", "poll", "read", "handle"};
     const char* phase_name = phase < sizeof phases / sizeof phases[0] ? phases[phase] : "unknown";
     ESP_LOGI(TAG,
-             "voice %ums: mic=%u tx=%u drop=%u queue=%ums ws=%u tx=%uB/s rx=%uB/s "
+             "voice %ums: mic=%u tx=%u drop=%u queue=%ums up=%s ws=%u tx=%uB/s rx=%uB/s "
              "decoded=%ums send=%u/%ums enc=%uus pending=%uB worker=%s/%ums stack=%u/%u/%uB",
              static_cast<unsigned>(now - s_diag_last_ms), static_cast<unsigned>(s_diag_mic_frames),
              static_cast<unsigned>(sent_frames - s_diag_prev_sent_frames),
              static_cast<unsigned>(s_diag_dropped_frames),
              static_cast<unsigned>((uxQueueMessagesWaiting(s_tx) + s_encoded_pending.load()) * 20),
+             s_uplink_paused.load() ? "off" : "on",
              static_cast<unsigned>(messages),
              static_cast<unsigned>((tx_bytes - s_diag_prev_tx_bytes) * 1000 / interval),
              static_cast<unsigned>((rx_bytes - s_diag_prev_rx_bytes) * 1000 / interval),
@@ -319,9 +346,22 @@ bool FetchDirectGrant(Grant* grant, const char** hint) {
         const cJSON* body = json;
         const cJSON* data = cJSON_GetObjectItemCaseSensitive(json, "data");
         if (cJSON_IsObject(data)) body = data;
-        const cJSON* url = cJSON_GetObjectItemCaseSensitive(body, "websocketUrl");
-        const cJSON* token = cJSON_GetObjectItemCaseSensitive(body, "connectToken");
         const cJSON* connection = cJSON_GetObjectItemCaseSensitive(body, "realtimeConnection");
+        // 首次 POST 可能把 WSS 凭据放在 realtimeConnection 外；connect-tokens 又可能放进去。
+        // 只读取固定字段，并按嵌套对象、data、响应根的顺序寻找完整的一对凭据。
+        const cJSON* candidates[] = {connection, body, json};
+        const cJSON* url = nullptr;
+        const cJSON* token = nullptr;
+        for (const cJSON* candidate : candidates) {
+            if (!cJSON_IsObject(candidate)) continue;
+            const cJSON* candidate_url = cJSON_GetObjectItemCaseSensitive(candidate, "websocketUrl");
+            const cJSON* candidate_token = cJSON_GetObjectItemCaseSensitive(candidate, "connectToken");
+            if (cJSON_IsString(candidate_url) && cJSON_IsString(candidate_token)) {
+                url = candidate_url;
+                token = candidate_token;
+                break;
+            }
+        }
         const bool has_format = cJSON_HasObjectItem(connection, "audio");
         WssAddress parsed = {};
         valid = cJSON_IsString(url) && cJSON_IsString(token) &&
@@ -361,7 +401,7 @@ void EndDirectSession() {
 bool Send(esp_transport_handle_t ws, char* json, size_t bytes) {
     const auto opcode = static_cast<ws_transport_opcodes_t>(WS_TRANSPORT_OPCODES_TEXT | WS_TRANSPORT_OPCODES_FIN);
     return esp_transport_ws_send_raw(ws, opcode, json,
-                                    static_cast<int>(bytes), 1000) == static_cast<int>(bytes);
+                                    static_cast<int>(bytes), kSendTimeoutMs) == static_cast<int>(bytes);
 }
 
 bool Send(esp_transport_handle_t ws, const char* json) {
@@ -404,6 +444,7 @@ public:
             else vQueueDelete(rx_queue_);
         }
         s_downlink_bytes.store(0);
+        s_uplink_paused.store(false);
 #if CONFIG_AGENT_LINK_REALTIME_OPUS
         if (decoder_) esp_opus_dec_close(decoder_);
         if (encoder_) esp_opus_enc_close(encoder_);
@@ -427,6 +468,42 @@ public:
     }
 
     bool Healthy() const { return running_.load(); }
+
+    // 回复期间停掉上行，优先保证下行音频和文本能持续收完。旧实现让麦克风
+    // 一直按 44 KB/s 推送，服务端生成较长回复时发送缓冲被顶满，1 秒写超时
+    // 就直接把整个会话拆掉。暂停时清掉积压，避免恢复后补发过期语音。
+    void PauseUplink() {
+        if (!continuous_) return;
+        const bool was_paused = s_uplink_paused.exchange(true);
+        {
+            std::lock_guard<std::mutex> lock(s_mutex);
+            if (s_tx) xQueueReset(s_tx);
+#if CONFIG_AGENT_LINK_REALTIME_OPUS
+            if (encoded_queue_) xQueueReset(encoded_queue_);
+            s_encoded_pending.store(0);
+#endif
+        }
+        paused_at_ = esp_timer_get_time();
+        resume_at_ = 0;
+        if (!was_paused) ESP_LOGI(TAG, "uplink paused while the agent replies");
+    }
+
+    void ResumeUplink(const char* reason) {
+        if (!continuous_ || !s_uplink_paused.exchange(false)) return;
+        paused_at_ = resume_at_ = 0;
+        ESP_LOGI(TAG, "uplink resumed (%s)", reason);
+    }
+
+    // response.audio.done 只代表网络侧收完，扬声器队列里往往还有数秒音频。
+    // 立刻开麦会把机器人自己的尾音送回服务端，因此等本地播放排空后再恢复。
+    void ResumeUplinkAfterPlayback() {
+        if (!continuous_ || !s_uplink_paused.load()) return;
+        const int64_t now = esp_timer_get_time();
+        const int64_t until = (play_due_ > now ? play_due_ : now) + 250000;
+        resume_at_ = until;
+        ESP_LOGI(TAG, "uplink resume scheduled after playback (%lld ms)",
+                 static_cast<long long>((until - now) / 1000));
+    }
 
     bool TxPending() const {
         if (input_opus_.load()) return encoded_queue_ && uxQueueMessagesWaiting(encoded_queue_);
@@ -574,6 +651,14 @@ public:
             input_opus_.store(audio_.input_opus);
             if (!keep || !OpenDecoder()) { cJSON_Delete(json); return false; }
             s_mute.store(false);
+            s_uplink_paused.store(false);
+            paused_at_ = resume_at_ = 0;
+            uplink_ready_ = true;
+            // 重连期间麦克风可能已排队，等新会话 ready 后只送新音频。
+            {
+                std::lock_guard<std::mutex> lock(s_mutex);
+                if (s_tx) xQueueReset(s_tx);
+            }
             if (!s_ready.exchange(true) && s_cb.state)
                 s_cb.state(true, continuous_ ? "Microphone on" : "Hold to talk, release to send");
             ESP_LOGI(TAG, "voice session ready (%s 16 kHz up, %s 24 kHz down, %s)",
@@ -608,12 +693,14 @@ public:
             ESP_LOGI(TAG, "reply processing: decode max %u us, sink max %u us, pacing max %u ms",
                      static_cast<unsigned>(max_decode_), static_cast<unsigned>(max_sink_),
                      static_cast<unsigned>(max_pacing_ / 1000));
+            ResumeUplinkAfterPlayback();
             ResetDecoder();
             if (s_cb.audio_end) s_cb.audio_end();
             if (s_cb.state && s_ready)
                 s_cb.state(true, continuous_ ? "Microphone on" : "Hold to talk, release to send");
         } else if (strcmp(event, "response.started") == 0) {
             ESP_LOGI(TAG, "reply started #%u", ++replies_);
+            PauseUplink();
             ResetDecoder();
             samples_ = encoded_bytes_ = packets_ = 0;
             last_audio_ = max_gap_ = 0;
@@ -621,6 +708,7 @@ public:
             if (s_cb.state && s_ready && !s_mute) s_cb.state(true, "Receiving agent reply");
         } else if (strcmp(event, "response.interrupted") == 0) {
             ESP_LOGI(TAG, "reply interrupted #%u (started=%u, ended=%u)", ++interruptions_, replies_, reply_ends_);
+            ResumeUplink("reply interrupted");
             if (reset_ != s_reset.load()) ResetAudio();
         } else if (strcmp(event, "transcript.partial") == 0 || strcmp(event, "transcript.final") == 0) {
             const cJSON* text = cJSON_GetObjectItemCaseSensitive(json, "text");
@@ -636,7 +724,18 @@ public:
     }
 
     bool FlushTx(esp_transport_handle_t ws, TxScratch* scratch) {
-        if (!s_ready) return true;
+        if (!s_ready || !uplink_ready_) return true;
+        if (s_uplink_paused.load(std::memory_order_acquire)) {
+            const int64_t now = esp_timer_get_time();
+            if (resume_at_ && now >= resume_at_) {
+                ResumeUplink("reply playback drained");
+            } else if (paused_at_ && now - paused_at_ > kUplinkPauseLimitUs) {
+                ESP_LOGW(TAG, "uplink pause guard expired; resuming without reply end");
+                ResumeUplink("pause guard");
+            } else {
+                return true;
+            }
+        }
         if (input_opus_.load()) {
 #if CONFIG_AGENT_LINK_REALTIME_OPUS
             if (!StartEncoder()) return false;
@@ -666,7 +765,7 @@ public:
                 memcpy(scratch->pcm, packet.data, pcm_bytes);
                 if (continuous_) {
                     Tx next;
-                    while (pcm_packets < kUplinkBatchPackets && Current(epoch_) &&
+                    while (pcm_packets < kRealtimeBatchPackets && Current(epoch_) &&
                            xQueuePeek(s_tx, &next, 0) == pdTRUE && next.kind == TxKind::kPcm) {
                         if (xQueueReceive(s_tx, &next, 0) != pdTRUE) break;
                         memcpy(scratch->pcm + pcm_bytes, next.data, next.bytes);
@@ -828,9 +927,12 @@ private:
 
     uint32_t epoch_;
     bool continuous_ = false;
+    std::atomic<bool> uplink_ready_{false};
     unsigned replies_ = 0, reply_ends_ = 0, interruptions_ = 0;
     uint32_t reset_ = s_reset.load();
     int64_t play_due_ = 0;
+    int64_t paused_at_ = 0;
+    int64_t resume_at_ = 0;
     AudioFormat audio_;
     std::atomic<bool> input_opus_{false};
     QueueHandle_t encoded_queue_ = nullptr;
@@ -853,25 +955,26 @@ private:
     agentlink::realtime::Pcm24To16 converter_;
 };
 
-void ConnectOnce(const Grant& grant) {
+EndReason ConnectOnce(const Grant& grant) {
+    EndReason reason = EndReason::kDone;
     WssAddress addr = {};
     if (!ParseWss(grant.url, &addr)) {
         ESP_LOGW(TAG, "rejected an invalid WSS URL");
-        return;
+        return reason;
     }
 
     VoiceWifiPower power;
     esp_transport_handle_t tls = esp_transport_ssl_init();
     if (!tls) {
         ESP_LOGE(TAG, "could not allocate TLS transport");
-        return;
+        return reason;
     }
     esp_transport_ssl_crt_bundle_attach(tls, esp_crt_bundle_attach);
     esp_transport_handle_t ws = esp_transport_ws_init(tls);
     if (!ws) {
         ESP_LOGE(TAG, "could not allocate WebSocket transport");
         esp_transport_destroy(tls);
-        return;
+        return reason;
     }
     const esp_transport_ws_config_t config = {
         .ws_path = addr.path,
@@ -882,7 +985,7 @@ void ConnectOnce(const Grant& grant) {
         ESP_LOGE(TAG, "could not set the realtime subprotocol");
         esp_transport_destroy(ws);
         esp_transport_destroy(tls);
-        return;
+        return reason;
     }
 
     auto* message = static_cast<uint8_t*>(heap_caps_malloc(kMessageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -890,7 +993,7 @@ void ConnectOnce(const Grant& grant) {
     if (!message) {
         esp_transport_destroy(ws);
         esp_transport_destroy(tls);
-        return;
+        return reason;
     }
     auto* scratch = static_cast<TxScratch*>(heap_caps_malloc(sizeof(TxScratch),
                                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -900,12 +1003,13 @@ void ConnectOnce(const Grant& grant) {
         free(message);
         esp_transport_destroy(ws);
         esp_transport_destroy(tls);
-        return;
+        return reason;
     }
     if (s_cb.state) s_cb.state(false, "Connecting voice");
     if (esp_transport_connect(ws, addr.host, addr.port, kConnectTimeoutMs) != 0) {
         ESP_LOGW(TAG, "WSS connection failed (upgrade HTTP %d)",
                  esp_transport_ws_get_upgrade_request_status(ws));
+        reason = EndReason::kTransport;
     } else {
         const int socket = esp_transport_get_socket(tls);
         const int enabled = 1;
@@ -918,15 +1022,18 @@ void ConnectOnce(const Grant& grant) {
             if (*p == '"' || *p == '\\') hello[n++] = '\\';
             hello[n++] = *p;
         }
+        const bool continuous = ServerEndpointing(grant);
         n += static_cast<size_t>(snprintf(hello + n, sizeof hello - n,
-                "\",\"endpointing\":{\"mode\":\"%s\"}}", grant.platform ? "server" : "client"));
+                "\",\"endpointing\":{\"mode\":\"%s\"}}", continuous ? "server" : "client"));
         if (!Current(grant.epoch)) {
             ESP_LOGI(TAG, "voice connection cancelled before session.connect");
+            reason = EndReason::kCancelled;
         } else if (!Send(ws, hello, n)) {
             ESP_LOGW(TAG, "session.connect could not be sent");
+            reason = EndReason::kTransport;
         } else {
             ESP_LOGI(TAG, "session.connect sent over WSS");
-            Call call(grant.epoch, grant.audio, grant.platform);
+            Call call(grant.epoch, grant.audio, continuous);
             agentlink::realtime::Message assembler(message, kMessageBytes);
             uint8_t* chunk = scratch->read;
             int frame_read = 0;
@@ -937,8 +1044,12 @@ void ConnectOnce(const Grant& grant) {
             int64_t last_rx = connected_at, last_ping = connected_at;
             SetWorkerPhase(0);
             const bool media_started = call.Start();
+            if (!media_started) reason = EndReason::kTransport;
             while (media_started && Current(grant.epoch) && call.Healthy()) {
-                if (!call.FlushTx(ws, scratch)) break;
+                if (!call.FlushTx(ws, scratch)) {
+                    reason = EndReason::kTransport;
+                    break;
+                }
                 if (pending) {
                     if (!call.Deliver(assembler.Opcode(), message, assembler.Size(), pending_at, pending_reset)) {
                         vTaskDelay(1);
@@ -947,43 +1058,71 @@ void ConnectOnce(const Grant& grant) {
                     pending = false;
                 }
                 const int64_t now = esp_timer_get_time();
-                if ((!s_ready && now - connected_at > kReadyTimeoutUs) || now - last_rx > 45000000) {
-                    ESP_LOGW(TAG, "voice session timed out");
+                if ((!s_ready && now - connected_at > kReadyTimeoutUs) || now - last_rx > kRxIdleTimeoutUs) {
+                    ESP_LOGW(TAG, "voice session timed out (%s, idle=%llus)", s_ready ? "rx idle" : "not ready",
+                             static_cast<unsigned long long>((now - last_rx) / 1000000));
+                    reason = EndReason::kTimeout;
                     break;
                 }
                 if (now - last_ping > 15000000) {
                     if (esp_transport_ws_send_raw(ws, static_cast<ws_transport_opcodes_t>(
-                            WS_TRANSPORT_OPCODES_PING | WS_TRANSPORT_OPCODES_FIN), nullptr, 0, 1000) < 0) break;
+                            WS_TRANSPORT_OPCODES_PING | WS_TRANSPORT_OPCODES_FIN), nullptr, 0, 1000) < 0) {
+                        reason = EndReason::kTransport;
+                        break;
+                    }
                     last_ping = now;
                 }
                 SetWorkerPhase(2);
                 const int polled = esp_transport_poll_read(ws, call.TxPending() ? 0 : 10);
                 SetWorkerPhase(0);
-                if (polled < 0) break;
+                if (polled < 0) {
+                    reason = EndReason::kTransport;
+                    break;
+                }
                 if (!polled) continue;
                 SetWorkerPhase(3);
                 const int got = esp_transport_read(ws, reinterpret_cast<char*>(chunk), sizeof scratch->read, 1000);
                 SetWorkerPhase(0);
-                if (got < 0 || !Current(grant.epoch)) break;
+                if (got < 0) {
+                    reason = EndReason::kTransport;
+                    break;
+                }
+                if (!Current(grant.epoch)) {
+                    reason = EndReason::kCancelled;
+                    break;
+                }
                 s_rx_bytes.fetch_add(got);
                 const auto opcode = esp_transport_ws_get_read_opcode(ws);
                 const int frame_size = esp_transport_ws_get_read_payload_len(ws);
                 const bool first = frame_read == 0;
                 frame_read += got;
                 const bool end = frame_read == frame_size;
-                if (frame_size < 0 || frame_read > frame_size || (got == 0 && !end)) break;
+                if (frame_size < 0 || frame_read > frame_size || (got == 0 && !end)) {
+                    reason = EndReason::kTransport;
+                    break;
+                }
                 last_rx = esp_timer_get_time();
-                if (opcode == WS_TRANSPORT_OPCODES_CLOSE) break;
+                if (opcode == WS_TRANSPORT_OPCODES_CLOSE) {
+                    reason = EndReason::kServer;
+                    break;
+                }
                 if (opcode == WS_TRANSPORT_OPCODES_PING || opcode == WS_TRANSPORT_OPCODES_PONG) {
-                    if (!first || !end || frame_size > 125) break;
+                    if (!first || !end || frame_size > 125) {
+                        reason = EndReason::kServer;
+                        break;
+                    }
                     if (opcode == WS_TRANSPORT_OPCODES_PING && esp_transport_ws_send_raw(ws,
                             static_cast<ws_transport_opcodes_t>(WS_TRANSPORT_OPCODES_PONG | WS_TRANSPORT_OPCODES_FIN),
-                            reinterpret_cast<char*>(chunk), got, 1000) < 0) break;
+                            reinterpret_cast<char*>(chunk), got, 1000) < 0) {
+                        reason = EndReason::kTransport;
+                        break;
+                    }
                 } else {
                     const auto result = assembler.Append(opcode, first, end,
                             esp_transport_ws_get_fin_flag(ws), chunk, static_cast<size_t>(got));
                     if (result == agentlink::realtime::Message::kError) {
                         ESP_LOGW(TAG, "invalid or oversized voice frame");
+                        reason = EndReason::kServer;
                         break;
                     }
                     if (result == agentlink::realtime::Message::kComplete) {
@@ -997,19 +1136,52 @@ void ConnectOnce(const Grant& grant) {
                 }
                 if (end) frame_read = 0;
             }
+            if (reason == EndReason::kDone) {
+                if (!Current(grant.epoch)) reason = EndReason::kCancelled;
+                else if (!call.Healthy()) reason = EndReason::kServer;
+                else reason = EndReason::kTransport;
+            }
+            ESP_LOGI(TAG, "voice loop ended (reason=%d)", static_cast<int>(reason));
         }
         memset(hello, 0, sizeof hello);
-        Send(ws, "{\"type\":\"session.end\"}");
+        // 传输层失败时不再往可能已损坏的 WSS 写 session.end，交给上层用同一
+        // Session 重新取 token 续接；主动挂断或服务端结束时才做优雅收尾。
+        if (reason != EndReason::kTransport) Send(ws, "{\"type\":\"session.end\"}");
         esp_transport_close(ws);
     }
     free(scratch);
     free(message);
     esp_transport_destroy(ws);
     esp_transport_destroy(tls);
+    return reason;
+}
+
+bool RefreshGrant(Grant* grant, const char** hint) {
+#if CONFIG_AGENT_LINK_REALTIME_DIRECT
+    if (grant->direct) return FetchDirectGrant(grant, hint);
+#endif
+    if (grant->platform) {
+        int status = 0;
+        const bool ok = cloud_platform_grant(grant->agent_id, grant->session_id, true,
+                                             grant->url, sizeof grant->url,
+                                             grant->token, sizeof grant->token,
+                                             &grant->audio, &status) == ESP_OK;
+        if (!ok) *hint = status == 409 ? "Voice session busy. End the previous call"
+                                       : "Voice reconnect failed. Tap Connect to retry";
+        return ok;
+    }
+    return false;
+}
+
+void ClearQueuedUplink() {
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (s_tx) xQueueReset(s_tx);
 }
 
 void Worker(void*) {
     Grant grant = {};
+    constexpr int kReconnectAttempts = 3;
+    constexpr uint32_t kReconnectDelayMs[kReconnectAttempts] = {1000, 2500, 4000};
     while (s_run.load(std::memory_order_acquire)) {
         if (xQueueReceive(s_grants, &grant, pdMS_TO_TICKS(500)) != pdTRUE) continue;
         const char* hint = "Voice ended. Tap Connect to retry";
@@ -1030,7 +1202,31 @@ void Worker(void*) {
             if (!granted) hint = status == 409 ? "Voice session busy. End the previous call"
                                  : "Voice access failed. Tap Connect to retry";
         }
-        if (granted && Current(grant.epoch)) ConnectOnce(grant);
+        EndReason reason = EndReason::kDone;
+        if (granted && Current(grant.epoch)) {
+            reason = ConnectOnce(grant);
+            // 只对“传输层短暂失败”续接；主动挂断、服务端结束和超时不在这里
+            // 反复重试。重连期间保持 s_ready=true，板端不会把一次抖动当成挂断。
+            for (int attempt = 0; reason == EndReason::kTransport &&
+                                  Current(grant.epoch) && attempt < kReconnectAttempts; ++attempt) {
+                const uint32_t delay_ms = kReconnectDelayMs[attempt];
+                ESP_LOGW(TAG, "voice transport lost; reconnect %d/%d in %ums",
+                         attempt + 1, kReconnectAttempts, static_cast<unsigned>(delay_ms));
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+                if (!Current(grant.epoch)) {
+                    reason = EndReason::kCancelled;
+                    break;
+                }
+                ClearQueuedUplink();
+                const char* retry_hint = "Voice reconnect failed. Tap Connect to retry";
+                if (!RefreshGrant(&grant, &retry_hint)) {
+                    hint = retry_hint;
+                    continue;
+                }
+                reason = ConnectOnce(grant);
+            }
+            if (reason == EndReason::kTransport) hint = "Voice reconnect failed. Tap Connect to retry";
+        }
         s_ready.store(false);
         ResetInput();
         if (s_cb.audio_reset) s_cb.audio_reset();
@@ -1053,7 +1249,7 @@ namespace {
 esp_err_t QueueGrant(Grant* grant) {
     grant->epoch = s_epoch.fetch_add(1) + 1;
     s_ready.store(false);
-    s_continuous.store(grant->platform);
+    s_continuous.store(ServerEndpointing(*grant));
     if (xQueueOverwrite(s_grants, grant) != pdPASS) return ESP_FAIL;
     if (!s_task.load(std::memory_order_acquire)) {
         TaskHandle_t task = nullptr;
@@ -1179,6 +1375,7 @@ void cloud_realtime_cancel(void) {
     s_epoch.fetch_add(1);
     s_ready.store(false);
     s_mute.store(true);
+    s_uplink_paused.store(false);
     s_input = AGENT_STREAM_KIND_COUNT;
     if (s_grants) xQueueReset(s_grants);
     if (s_tx) xQueueReset(s_tx);
@@ -1219,6 +1416,14 @@ esp_err_t cloud_realtime_stream_write(agent_stream_t type, const uint8_t* data, 
     std::lock_guard<std::mutex> lock(s_mutex);
     if (!s_run || !s_ready || s_input != type) return ESP_ERR_INVALID_STATE;
     const size_t packets = (bytes + kMicBytes - 1) / kMicBytes;
+    if (s_uplink_paused.load(std::memory_order_acquire)) {
+        if (s_continuous) {
+            s_diag_mic_frames += static_cast<uint32_t>(packets);
+            s_diag_dropped_frames += static_cast<uint32_t>(packets);
+            ReportUplink();
+        }
+        return ESP_OK;
+    }
     if (s_continuous) s_diag_mic_frames += static_cast<uint32_t>(packets);
     if (packets + 2 > uxQueueSpacesAvailable(s_tx)) {
         if (s_continuous) {
